@@ -3,6 +3,7 @@
 typedef struct {
     ngx_uint_t                   recv;
     ngx_uint_t                   sent;
+    ngx_uint_t                   bytes_in;
     ngx_array_t                  monitor_index;
     ngx_flag_t                   bypass;
 } ngx_http_reqstat_store_t;
@@ -56,11 +57,15 @@ static void ngx_http_reqstat_rbtree_insert_value(ngx_rbtree_node_t *temp,
 static ngx_http_reqstat_store_t *
     ngx_http_reqstat_create_store(ngx_http_request_t *r,
     ngx_http_reqstat_conf_t *slcf);
+static ngx_http_reqstat_store_t *
+    ngx_http_reqstat_lookup_fnode(ngx_http_request_t *r,
+    ngx_http_reqstat_conf_t *slcf);
 
 static ngx_int_t ngx_http_reqstat_input_body_filter(ngx_http_request_t *r,
     ngx_buf_t *buf);
 static ngx_int_t ngx_http_reqstat_output_body_filter(ngx_http_request_t *r,
     ngx_chain_t *in);
+
 
 static ngx_command_t   ngx_http_reqstat_commands[] = {
 
@@ -398,6 +403,11 @@ ngx_http_reqstat_log_handler(ngx_http_request_t *r)
         if (store == NULL) {
             return NGX_ERROR;
         }
+    } else {
+        store = ngx_http_reqstat_lookup_fnode(r, slcf);
+        if (store == NULL) {
+            return NGX_ERROR;
+        }
     }
 
     if (store->bypass) {
@@ -414,7 +424,7 @@ ngx_http_reqstat_log_handler(ngx_http_request_t *r)
         ngx_http_reqstat_count(fnode, NGX_HTTP_REQSTAT_REQ_TOTAL, 1);
         ngx_http_reqstat_count(fnode, NGX_HTTP_REQSTAT_BYTES_IN,
                                r->connection->received
-                                    - (store ? store->recv : 0));
+                                    - (store ? store->recv : 0) + store->bytes_in);
         ngx_http_reqstat_count(fnode, NGX_HTTP_REQSTAT_BYTES_OUT,
                                r->connection->sent
                                     - (store ? store->sent : 0));
@@ -763,26 +773,30 @@ ngx_http_reqstat_rbtree_insert_value(ngx_rbtree_node_t *temp,
 static ngx_int_t
 ngx_http_reqstat_input_body_filter(ngx_http_request_t *r, ngx_buf_t *buf)
 {
-    ngx_uint_t                    i, diff;
+    ngx_uint_t                    diff;
+    ngx_int_t                     rc;
     ngx_http_reqstat_conf_t      *slcf;
     ngx_http_reqstat_store_t     *store;
-    ngx_http_reqstat_rbnode_t    *fnode, **fnode_store;
 
     slcf = ngx_http_get_module_loc_conf(r, ngx_http_reqstat_module);
 
     if (slcf->monitor == NULL) {
         return ngx_http_next_input_body_filter(r, buf);
     }
-
-    store = ngx_http_get_module_ctx(r, ngx_http_reqstat_module);
+    
+    store = ngx_pcalloc(r->pool, sizeof(ngx_http_reqstat_store_t));
     if (store == NULL) {
-        store = ngx_http_reqstat_create_store(r, slcf);
-        if (store == NULL) {
-            return NGX_ERROR;
-        }
-
-        ngx_http_set_ctx(r, store, ngx_http_reqstat_module);
+        return NGX_ERROR;
     }
+  
+    rc = ngx_http_test_predicates(r, slcf->bypass);
+    if(rc == NGX_ERROR) {
+        return NGX_ERROR;
+    } else if(rc == NGX_DECLINED) {
+        store->bypass = 1;
+    }
+    
+    ngx_http_set_ctx(r, store, ngx_http_reqstat_module);
 
     if (store->bypass) {
         return ngx_http_next_input_body_filter(r, buf);
@@ -790,14 +804,10 @@ ngx_http_reqstat_input_body_filter(ngx_http_request_t *r, ngx_buf_t *buf)
 
     diff = r->connection->received - store->recv;
     store->recv = r->connection->received;
-
-    fnode_store = store->monitor_index.elts;
-    for (i = 0; i < store->monitor_index.nelts; i++) {
-        fnode = fnode_store[i];
-        ngx_http_reqstat_count(fnode, NGX_HTTP_REQSTAT_BYTES_IN, diff);
-    }
+    store->bytes_in = diff;
 
     return ngx_http_next_input_body_filter(r, buf);
+
 }
 
 
@@ -839,6 +849,59 @@ ngx_http_reqstat_output_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
     }
 
     return ngx_http_next_output_body_filter(r, in);
+}
+
+
+static ngx_http_reqstat_store_t *
+ngx_http_reqstat_lookup_fnode(ngx_http_request_t *r,
+    ngx_http_reqstat_conf_t *slcf)
+{
+    ngx_str_t                     val;
+    ngx_uint_t                    i;
+    ngx_shm_zone_t              **shm_zone, *z;
+    ngx_http_reqstat_ctx_t       *ctx;
+    ngx_http_reqstat_store_t     *store;
+    ngx_http_reqstat_rbnode_t    *fnode, **fnode_store;
+    
+    store = ngx_http_get_module_ctx(r, ngx_http_reqstat_module);
+
+    if (store == NULL) {
+        store = ngx_http_reqstat_create_store(r, slcf);
+        return store;
+    }
+    
+    if (ngx_array_init(&store->monitor_index, r->pool, slcf->monitor->nelts,
+                       sizeof(ngx_http_reqstat_rbnode_t *)) == NGX_ERROR)
+    {
+        return NULL;
+    }
+
+    shm_zone = slcf->monitor->elts;
+    for (i = 0; i < slcf->monitor->nelts; i++) {
+        z = shm_zone[i];
+        ctx = z->data;
+
+        if (ngx_http_complex_value(r, &ctx->value, &val) != NGX_OK) {
+            ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                          "failed to reap the key \"%V\"", ctx->val);
+            continue;
+        }
+
+        fnode = ngx_http_reqstat_rbtree_lookup(shm_zone[i], &val);
+
+        if (fnode == NULL) {
+            ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                          "failed to alloc node in zone \"%V\", "
+                          "enlarge it please",
+                          &z->shm.name);
+
+        } else {
+            fnode_store = ngx_array_push(&store->monitor_index);
+            *fnode_store = fnode;
+        }
+    }
+
+    return store;
 }
 
 
